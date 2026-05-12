@@ -8,7 +8,8 @@ pkg <- c(
   "DT",
   "tibble",
   "htmltools",
-  "lubridate"
+  "lubridate",
+  "openxlsx"
 )
 
 missing_pkg <- pkg[!vapply(pkg, requireNamespace, logical(1), quietly = TRUE)]
@@ -82,6 +83,18 @@ read_database <- function() {
     stats::setNames(sheet_names)
 }
 
+write_sheet_to_workbook <- function(database_file, sheet_name, data_tbl) {
+  wb <- openxlsx::loadWorkbook(database_file)
+  
+  if (sheet_name %in% openxlsx::sheets(wb)) {
+    openxlsx::removeWorksheet(wb, sheet_name)
+  }
+  
+  openxlsx::addWorksheet(wb, sheet_name)
+  openxlsx::writeData(wb, sheet = sheet_name, x = data_tbl)
+  openxlsx::saveWorkbook(wb, database_file, overwrite = TRUE)
+}
+
 get_active_users <- function(database) {
   database$users %>%
     dplyr::filter(status == "active") %>%
@@ -145,6 +158,22 @@ get_choices <- function(lists_tbl, list_name) {
     dplyr::arrange(as.numeric(sort_order))
   
   stats::setNames(selected$value, selected$label)
+}
+
+get_label_from_value <- function(lists_tbl, list_name, value) {
+  out <- lists_tbl %>%
+    dplyr::filter(
+      .data$list_name == !!list_name,
+      .data$value == !!value,
+      active == "TRUE"
+    ) %>%
+    dplyr::pull(label)
+  
+  if (length(out) == 0 || is.na(out[1])) {
+    return(value)
+  }
+  
+  out[1]
 }
 
 get_rule_points <- function(priority_rules_tbl, rule_group_value, condition_value_value) {
@@ -295,6 +324,80 @@ format_computers_public <- function(computers_tbl) {
     )
 }
 
+format_reservations_public <- function(reservations_tbl, users_tbl, lists_tbl) {
+  if (nrow(reservations_tbl) == 0) {
+    return(
+      tibble::tibble(
+        "Reserva" = character(),
+        "Usuário" = character(),
+        "Computador solicitado" = character(),
+        "Computador atribuído" = character(),
+        "Início" = character(),
+        "Fim previsto" = character(),
+        "Duração h" = character(),
+        "Tipo" = character(),
+        "Status" = character(),
+        "Aprovação" = character(),
+        "Prioridade" = character()
+      )
+    )
+  }
+  
+  reservations_tbl %>%
+    dplyr::left_join(
+      users_tbl %>% dplyr::select(user_id, full_name),
+      by = "user_id"
+    ) %>%
+    dplyr::mutate(
+      computer_requested_label = purrr::map_chr(
+        computer_requested,
+        ~ get_label_from_value(lists_tbl, "computer_requested", .x)
+      ),
+      computer_assigned_label = purrr::map_chr(
+        computer_assigned,
+        ~ get_label_from_value(lists_tbl, "computer_assigned", .x)
+      ),
+      processing_type_label = purrr::map_chr(
+        processing_type,
+        ~ get_label_from_value(lists_tbl, "processing_type", .x)
+      ),
+      status_label = purrr::map_chr(
+        status,
+        ~ get_label_from_value(lists_tbl, "reservation_status", .x)
+      ),
+      approval_mode_label = purrr::map_chr(
+        approval_mode,
+        ~ get_label_from_value(lists_tbl, "approval_mode", .x)
+      )
+    ) %>%
+    dplyr::select(
+      reservation_id,
+      full_name,
+      computer_requested_label,
+      computer_assigned_label,
+      start_time,
+      end_time,
+      estimated_hours,
+      processing_type_label,
+      status_label,
+      approval_mode_label,
+      priority_score
+    ) %>%
+    dplyr::rename(
+      "Reserva" = reservation_id,
+      "Usuário" = full_name,
+      "Computador solicitado" = computer_requested_label,
+      "Computador atribuído" = computer_assigned_label,
+      "Início" = start_time,
+      "Fim previsto" = end_time,
+      "Duração h" = estimated_hours,
+      "Tipo" = processing_type_label,
+      "Status" = status_label,
+      "Aprovação" = approval_mode_label,
+      "Prioridade" = priority_score
+    )
+}
+
 time_choices <- sprintf(
   "%02d:%02d",
   rep(0:23, each = 2),
@@ -309,6 +412,17 @@ parse_datetime <- function(date_value, time_value, timezone_value) {
 }
 
 format_datetime_pt <- function(datetime_value, timezone_value = "America/Sao_Paulo") {
+  if (is.null(datetime_value) || is.na(datetime_value)) {
+    return("")
+  }
+  
+  format(
+    lubridate::with_tz(datetime_value, timezone_value),
+    "%Y-%m-%d %H:%M:%S"
+  )
+}
+
+format_datetime_label_pt <- function(datetime_value, timezone_value = "America/Sao_Paulo") {
   if (is.null(datetime_value) || is.na(datetime_value)) {
     return("")
   }
@@ -466,6 +580,54 @@ decide_reservation_status <- function(approval_mode, settings_tbl) {
   get_setting_value(settings_tbl, "default_manual_approval_status", "pending")
 }
 
+generate_reservation_id <- function() {
+  paste0(
+    "res_",
+    format(Sys.time(), "%Y%m%d_%H%M%S"),
+    "_",
+    sample(1000:9999, 1)
+  )
+}
+
+create_reservation_row <- function(preview, timezone_value) {
+  now_value <- lubridate::now(tzone = timezone_value)
+  
+  tibble::tibble(
+    reservation_id = generate_reservation_id(),
+    created_at = format_datetime_pt(now_value, timezone_value),
+    updated_at = format_datetime_pt(now_value, timezone_value),
+    user_id = preview$user_id,
+    computer_requested = preview$computer_requested,
+    computer_assigned = preview$computer_assigned,
+    start_time = format_datetime_pt(preview$start_time, timezone_value),
+    end_time = format_datetime_pt(preview$end_time, timezone_value),
+    estimated_hours = as.character(preview$estimated_hours),
+    main_environment = preview$main_environment,
+    processing_type = preview$processing_type,
+    computing_demand = preview$computing_demand,
+    uses_gpu = preview$uses_gpu,
+    requires_super_2 = preview$requires_super_2,
+    can_be_reallocated = preview$can_be_reallocated,
+    deadline = ifelse(
+      is.null(preview$deadline) || is.na(preview$deadline),
+      NA_character_,
+      as.character(as.Date(preview$deadline))
+    ),
+    justification = preview$justification,
+    priority_score = as.character(preview$priority_score),
+    status = preview$status,
+    approval_mode = preview$approval_mode,
+    approved_by = NA_character_,
+    approved_at = NA_character_,
+    rejected_by = NA_character_,
+    rejected_at = NA_character_,
+    cancelled_by = NA_character_,
+    cancelled_at = NA_character_,
+    admin_notes = NA_character_,
+    public_notes = preview$public_notes
+  )
+}
+
 dt_language_pt <- list(
   search = "Buscar:",
   lengthMenu = "Mostrar _MENU_ registros",
@@ -538,7 +700,7 @@ hero_ui <- function() {
       tags$p(
         "Painel de validação conectado à base local do sistema. ",
         "Esta etapa confirma usuários, computadores, listas, regras e configurações ",
-        "antes da criação do formulário real de reservas."
+        "antes da integração final com o Google Sheets."
       )
     ),
     tags$aside(
@@ -553,8 +715,8 @@ hero_ui <- function() {
           tags$strong("Excel local")
         ),
         tags$div(
-          tags$span("Próxima etapa"),
-          tags$strong("Formulário")
+          tags$span("Etapa atual"),
+          tags$strong("Envio local")
         )
       )
     )
@@ -701,7 +863,15 @@ reservation_preview_ui <- function(preview) {
     ),
     tags$p(
       class = "preview-note",
-      "Esta etapa ainda não grava a solicitação na planilha. É apenas uma simulação segura da lógica do sistema."
+      "Confira os dados antes de enviar. Nesta etapa, a solicitação será gravada apenas no arquivo Excel local."
+    ),
+    tags$div(
+      class = "submit-area",
+      actionButton(
+        inputId = "submit_booking",
+        label = "Enviar solicitação",
+        class = "btn-success"
+      )
     )
   )
 }
@@ -728,8 +898,6 @@ app_css <- "
   --green-soft: #e8f7ef;
   --orange: #b85c00;
   --orange-soft: #fff2df;
-  --red: #b42318;
-  --red-soft: #fdecec;
   --border: #e5e7eb;
   --shadow: 0 20px 55px rgba(15, 23, 42, 0.08);
   --shadow-soft: 0 12px 30px rgba(15, 23, 42, 0.05);
@@ -1187,6 +1355,17 @@ body {
   margin-bottom: 0;
 }
 
+.submit-area {
+  margin-top: 18px;
+}
+
+.submit-area .btn {
+  width: 100%;
+  border-radius: 999px;
+  font-weight: 850;
+  min-height: 44px;
+}
+
 .computer-card-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1476,7 +1655,7 @@ ui <- bslib::page_navbar(
       class = "metric-grid",
       metric_card_ui("Usuários ativos", "n_users"),
       metric_card_ui("Computadores ativos", "n_computers"),
-      metric_card_ui("Itens de lista", "n_lists"),
+      metric_card_ui("Reservas registradas", "n_reservations"),
       metric_card_ui("Regras de prioridade", "n_rules")
     ),
     tags$div(
@@ -1498,7 +1677,7 @@ ui <- bslib::page_navbar(
       class = "section-card",
       tags$h2("Solicitar reserva"),
       tags$p(
-        "Esta versão gera apenas uma prévia. A solicitação ainda não será gravada na planilha."
+        "Gere a prévia, confira os dados e envie a solicitação. Nesta fase, a solicitação será gravada no arquivo Excel local."
       ),
       tags$div(
         class = "form-layout",
@@ -1628,6 +1807,16 @@ ui <- bslib::page_navbar(
   ),
   
   bslib::nav_panel(
+    title = "Reservas",
+    tags$div(
+      class = "section-card",
+      tags$h2("Reservas registradas"),
+      tags$p("Tabela com as solicitações gravadas localmente na aba reservations."),
+      DT::DTOutput("reservations_table")
+    )
+  ),
+  
+  bslib::nav_panel(
     title = "Usuários",
     tags$div(
       class = "section-card",
@@ -1674,7 +1863,12 @@ ui <- bslib::page_navbar(
 )
 
 server <- function(input, output, session) {
+  reload_key <- reactiveVal(0)
+  last_submitted_id <- reactiveVal(NULL)
+  
   database <- reactive({
+    reload_key()
+    
     validate(
       need(file.exists(database_file), paste("Arquivo não encontrado:", database_file))
     )
@@ -1692,6 +1886,10 @@ server <- function(input, output, session) {
   
   lists <- reactive({
     get_active_lists(database())
+  })
+  
+  reservations <- reactive({
+    database()$reservations
   })
   
   priority_rules <- reactive({
@@ -1800,8 +1998,8 @@ server <- function(input, output, session) {
     nrow(computers())
   })
   
-  output$n_lists <- renderText({
-    nrow(lists())
+  output$n_reservations <- renderText({
+    nrow(reservations())
   })
   
   output$n_rules <- renderText({
@@ -1809,7 +2007,7 @@ server <- function(input, output, session) {
   })
   
   output$system_summary <- renderUI({
-    reservations_n <- nrow(database()$reservations)
+    reservations_n <- nrow(reservations())
     usage_n <- nrow(database()$usage_log)
     audit_n <- nrow(database()$audit_log)
     
@@ -1832,7 +2030,7 @@ server <- function(input, output, session) {
         " usuários ativos, ",
         tags$strong(nrow(computers())),
         " computadores ativos, ",
-        tags$strong(nrow(lists())),
+        tags$strong(nrow(database()$lists)),
         " itens de lista, ",
         tags$strong(nrow(priority_rules())),
         " regras de prioridade e ",
@@ -1890,14 +2088,14 @@ server <- function(input, output, session) {
     assigned_computer <- suggest_computer_assignment(
       computer_requested = input$booking_computer_requested,
       computing_demand = input$booking_computing_demand,
-      reservations_tbl = database()$reservations,
+      reservations_tbl = reservations(),
       start_time_value = start_time_value,
       end_time_value = end_time_value,
       timezone_value = timezone_value
     )
     
     has_conflict <- check_reservation_conflict(
-      reservations_tbl = database()$reservations,
+      reservations_tbl = reservations(),
       computer_id_value = assigned_computer,
       start_time_value = start_time_value,
       end_time_value = end_time_value,
@@ -1947,9 +2145,9 @@ server <- function(input, output, session) {
       computer_assigned = assigned_computer,
       computer_assigned_label = names(choices_computer_assigned)[match(assigned_computer, choices_computer_assigned)],
       start_time = start_time_value,
-      start_time_label = format_datetime_pt(start_time_value, timezone_value),
+      start_time_label = format_datetime_label_pt(start_time_value, timezone_value),
       end_time = end_time_value,
-      end_time_label = format_datetime_pt(end_time_value, timezone_value),
+      end_time_label = format_datetime_label_pt(end_time_value, timezone_value),
       estimated_hours = input$booking_estimated_hours,
       main_environment = input$booking_main_environment,
       main_environment_label = names(choices_environment)[match(input$booking_main_environment, choices_environment)],
@@ -1976,6 +2174,102 @@ server <- function(input, output, session) {
   
   output$booking_preview <- renderUI({
     reservation_preview_ui(booking_preview_data())
+  })
+  
+  observeEvent(input$submit_booking, {
+    preview <- booking_preview_data()
+    req(preview)
+    
+    timezone_value <- get_setting_value(settings(), "timezone", "America/Sao_Paulo")
+    new_reservation <- create_reservation_row(preview, timezone_value)
+    
+    reservations_current <- reservations() %>%
+      dplyr::mutate(
+        dplyr::across(
+          dplyr::everything(),
+          ~ as.character(.x)
+        )
+      )
+    
+    new_reservation <- new_reservation %>%
+      dplyr::mutate(
+        dplyr::across(
+          dplyr::everything(),
+          ~ as.character(.x)
+        )
+      )
+    
+    missing_in_current <- setdiff(names(new_reservation), names(reservations_current))
+    
+    if (length(missing_in_current) > 0) {
+      for (col_name in missing_in_current) {
+        reservations_current[[col_name]] <- NA_character_
+      }
+    }
+    
+    missing_in_new <- setdiff(names(reservations_current), names(new_reservation))
+    
+    if (length(missing_in_new) > 0) {
+      for (col_name in missing_in_new) {
+        new_reservation[[col_name]] <- NA_character_
+      }
+    }
+    
+    new_reservation <- new_reservation %>%
+      dplyr::select(dplyr::all_of(names(reservations_current)))
+    
+    reservations_updated <- dplyr::bind_rows(
+      reservations_current,
+      new_reservation
+    )
+    
+    tryCatch(
+      {
+        write_sheet_to_workbook(
+          database_file = database_file,
+          sheet_name = "reservations",
+          data_tbl = reservations_updated
+        )
+        
+        last_submitted_id(new_reservation$reservation_id[1])
+        reload_key(reload_key() + 1)
+        
+        showNotification(
+          paste0(
+            "Solicitação enviada com sucesso: ",
+            new_reservation$reservation_id[1]
+          ),
+          type = "message",
+          duration = 6
+        )
+        
+        updateTabsetPanel(session, "main_nav", selected = "Reservas")
+      },
+      error = function(e) {
+        showNotification(
+          paste(
+            "Não foi possível gravar a solicitação. Verifique se o arquivo Excel está fechado.",
+            e$message
+          ),
+          type = "error",
+          duration = 10
+        )
+      }
+    )
+  })
+  
+  output$reservations_table <- DT::renderDT({
+    DT::datatable(
+      format_reservations_public(reservations(), database()$users, lists()),
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        order = list(list(4, "desc")),
+        language = dt_language_pt
+      )
+    )
   })
   
   output$users_table <- DT::renderDT({
