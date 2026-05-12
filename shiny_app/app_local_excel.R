@@ -1,14 +1,15 @@
 pkg <- c(
   "shiny",
   "bslib",
-  "googlesheets4",
+  "readxl",
   "dplyr",
   "stringr",
   "purrr",
   "DT",
   "tibble",
   "htmltools",
-  "lubridate"
+  "lubridate",
+  "openxlsx"
 )
 
 missing_pkg <- pkg[!vapply(pkg, requireNamespace, logical(1), quietly = TRUE)]
@@ -30,15 +31,12 @@ project_root <- if (basename(app_dir) == "shiny_app") {
   app_dir
 }
 
-sheet_url <- Sys.getenv("LAB_SCHEDULER_SHEET_URL")
-
-if (sheet_url == "") {
-  stop("Set LAB_SCHEDULER_SHEET_URL before running the app.")
-}
-
-googlesheets4::gs4_auth(email = TRUE)
-
-database_file <- sheet_url
+database_file <- file.path(
+  project_root,
+  "data",
+  "database",
+  "lab_processing_scheduler_database.xlsx"
+)
 
 logo_dir <- file.path(
   project_root,
@@ -52,15 +50,12 @@ if (dir.exists(logo_dir)) {
 }
 
 read_sheet_clean <- function(sheet_name) {
-  googlesheets4::read_sheet(
-    ss = sheet_url,
+  readxl::read_excel(
+    path = database_file,
     sheet = sheet_name,
-    col_types = "c"
+    col_types = "text"
   ) %>%
     dplyr::rename_with(stringr::str_trim) %>%
-    dplyr::select(
-      !dplyr::matches("^\\.\\.\\.[0-9]+$")
-    ) %>%
     dplyr::mutate(
       dplyr::across(
         dplyr::everything(),
@@ -89,38 +84,15 @@ read_database <- function() {
 }
 
 write_sheet_to_workbook <- function(database_file, sheet_name, data_tbl) {
-  sheet_url_value <- database_file
+  wb <- openxlsx::loadWorkbook(database_file)
   
-  data_tbl <- data_tbl %>%
-    dplyr::mutate(
-      dplyr::across(
-        dplyr::everything(),
-        ~ as.character(.x)
-      )
-    )
-  
-  available_sheets <- googlesheets4::sheet_names(sheet_url_value)
-  
-  if (!sheet_name %in% available_sheets) {
-    googlesheets4::sheet_add(
-      ss = sheet_url_value,
-      sheet = sheet_name
-    )
+  if (sheet_name %in% openxlsx::sheets(wb)) {
+    openxlsx::removeWorksheet(wb, sheet_name)
   }
   
-  googlesheets4::range_clear(
-    ss = sheet_url_value,
-    sheet = sheet_name
-  )
-  
-  googlesheets4::range_write(
-    ss = sheet_url_value,
-    data = data_tbl,
-    sheet = sheet_name,
-    range = "A1",
-    col_names = TRUE,
-    reformat = FALSE
-  )
+  openxlsx::addWorksheet(wb, sheet_name)
+  openxlsx::writeData(wb, sheet = sheet_name, x = data_tbl)
+  openxlsx::saveWorkbook(wb, database_file, overwrite = TRUE)
 }
 
 align_tables_as_character <- function(reference_tbl, new_tbl) {
@@ -1203,24 +1175,25 @@ hero_ui <- function() {
       tags$div(class = "hero-badge", "Banco de dados do sistema"),
       tags$h1("Reserva dos Computadores de Processamento"),
       tags$p(
-        "Sistema conectado ao Google Sheets para solicitação, aprovação e acompanhamento ",
-        "das reservas dos computadores Super 1 e Super 2."
+        "Painel de validação conectado à base local do sistema. ",
+        "Esta etapa confirma usuários, computadores, listas, regras e configurações ",
+        "antes da integração final com o Google Sheets."
       )
     ),
     tags$aside(
       class = "hero-summary-card",
       tags$span(class = "summary-label", "Status do banco"),
       tags$div(class = "summary-main", "OK"),
-      tags$p("Base conectada ao Google Sheets e pronta para alimentar o Shiny."),
+      tags$p("Planilha lida com sucesso e pronta para alimentar o Shiny."),
       tags$div(
         class = "summary-list",
         tags$div(
           tags$span("Fonte atual"),
-          tags$strong("Google Sheets")
+          tags$strong("Excel local")
         ),
         tags$div(
           tags$span("Etapa atual"),
-          tags$strong("Banco online")
+          tags$strong("Painel público local")
         )
       )
     )
@@ -1367,7 +1340,7 @@ reservation_preview_ui <- function(preview) {
     ),
     tags$p(
       class = "preview-note",
-      "Confira os dados antes de enviar. A solicitação será gravada no Google Sheets."
+      "Confira os dados antes de enviar. Nesta etapa, a solicitação será gravada apenas no arquivo Excel local."
     ),
     tags$div(
       class = "submit-area",
@@ -2294,7 +2267,7 @@ ui <- bslib::page_navbar(
       class = "section-card",
       tags$h2("Solicitar reserva"),
       tags$p(
-        "Gere a prévia, confira os dados e envie a solicitação. A reserva será gravada no Google Sheets."
+        "Gere a prévia, confira os dados e envie a solicitação. Nesta fase, a solicitação será gravada no arquivo Excel local."
       ),
       tags$div(
         class = "form-layout",
@@ -2428,7 +2401,7 @@ ui <- bslib::page_navbar(
     tags$div(
       class = "section-card",
       tags$h2("Reservas registradas"),
-      tags$p("Tabela com as solicitações gravadas no Google Sheets."),
+      tags$p("Tabela com as solicitações gravadas localmente na aba reservations."),
       DT::DTOutput("reservations_table")
     )
   ),
@@ -2495,7 +2468,7 @@ ui <- bslib::page_navbar(
     tags$div(
       class = "section-card",
       tags$h2("Auditoria"),
-      tags$p("Registro das ações administrativas gravadas na aba audit_log."),
+      tags$p("Registro local das ações administrativas gravadas na aba audit_log."),
       DT::DTOutput("audit_table")
     )
   )
@@ -2510,7 +2483,7 @@ server <- function(input, output, session) {
     reload_key()
     
     validate(
-      need(sheet_url != "", "Google Sheets URL not configured.")
+      need(file.exists(database_file), paste("Arquivo não encontrado:", database_file))
     )
     
     read_database()
@@ -2656,8 +2629,8 @@ server <- function(input, output, session) {
     audit_n <- nrow(audit_log())
     
     source_label <- ifelse(
-      sheet_url != "",
-      "Google Sheets",
+      file.exists(database_file),
+      "Excel local",
       "Fonte não encontrada"
     )
     
@@ -2666,10 +2639,10 @@ server <- function(input, output, session) {
     
     tagList(
       tags$p(
-        tags$span(class = "status-ok", "Conexão online funcionando")
+        tags$span(class = "status-ok", "Conexão local funcionando")
       ),
       tags$p(
-        "A base foi lida com sucesso. Existem ",
+        "A planilha foi lida com sucesso. Existem ",
         tags$strong(nrow(users())),
         " usuários ativos, ",
         tags$strong(nrow(computers())),
@@ -2929,7 +2902,7 @@ server <- function(input, output, session) {
       error = function(e) {
         showNotification(
           paste(
-            "Não foi possível gravar a solicitação no Google Sheets.",
+            "Não foi possível gravar a solicitação. Verifique se o arquivo Excel está fechado.",
             e$message
           ),
           type = "error",
@@ -3206,7 +3179,7 @@ server <- function(input, output, session) {
       error = function(e) {
         showNotification(
           paste(
-            "Não foi possível atualizar a reserva no Google Sheets.",
+            "Não foi possível atualizar a reserva. Verifique se o Excel está fechado.",
             e$message
           ),
           type = "error",
