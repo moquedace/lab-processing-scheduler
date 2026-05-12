@@ -486,6 +486,306 @@ format_audit_public <- function(audit_tbl, users_tbl) {
     )
 }
 
+format_datetime_label_vector <- function(datetime_value, timezone_value = "America/Sao_Paulo") {
+  if (length(datetime_value) == 0) {
+    return(character(0))
+  }
+  
+  datetime_value <- lubridate::with_tz(datetime_value, timezone_value)
+  
+  out <- format(datetime_value, "%d/%m/%Y %H:%M")
+  out[is.na(datetime_value)] <- ""
+  out
+}
+
+empty_public_reservation_table <- function(settings_tbl) {
+  show_user_level <- get_setting_logical(settings_tbl, "public_show_user_level", FALSE)
+  show_processing_type <- get_setting_logical(settings_tbl, "public_show_processing_type", TRUE)
+  show_computing_demand <- get_setting_logical(settings_tbl, "public_show_computing_demand", FALSE)
+  
+  column_names <- c("Computador", "Usuário")
+  
+  if (show_user_level) {
+    column_names <- c(column_names, "Categoria")
+  }
+  
+  column_names <- c(column_names, "Início", "Fim previsto")
+  
+  if (show_processing_type) {
+    column_names <- c(column_names, "Tipo de processamento")
+  }
+  
+  if (show_computing_demand) {
+    column_names <- c(column_names, "Demanda computacional")
+  }
+  
+  column_names <- c(column_names, "Status")
+  
+  tibble::as_tibble(
+    stats::setNames(
+      rep(list(character()), length(column_names)),
+      column_names
+    )
+  )
+}
+
+format_public_reservations <- function(
+    reservations_tbl,
+    users_tbl,
+    lists_tbl,
+    settings_tbl,
+    status_values,
+    include_current = TRUE
+) {
+  timezone_value <- get_setting_value(settings_tbl, "timezone", "America/Sao_Paulo")
+  now_value <- lubridate::now(tzone = timezone_value)
+  
+  show_user_level <- get_setting_logical(settings_tbl, "public_show_user_level", FALSE)
+  show_processing_type <- get_setting_logical(settings_tbl, "public_show_processing_type", TRUE)
+  show_computing_demand <- get_setting_logical(settings_tbl, "public_show_computing_demand", FALSE)
+  
+  if (nrow(reservations_tbl) == 0) {
+    return(empty_public_reservation_table(settings_tbl))
+  }
+  
+  out <- reservations_tbl %>%
+    dplyr::mutate(
+      start_dt = lubridate::ymd_hms(start_time, tz = timezone_value, quiet = TRUE),
+      end_dt = lubridate::ymd_hms(end_time, tz = timezone_value, quiet = TRUE)
+    ) %>%
+    dplyr::filter(
+      status %in% status_values,
+      !is.na(start_dt),
+      !is.na(end_dt)
+    )
+  
+  if (include_current) {
+    out <- out %>%
+      dplyr::filter(end_dt >= now_value)
+  } else {
+    out <- out %>%
+      dplyr::filter(start_dt >= now_value)
+  }
+  
+  if (nrow(out) == 0) {
+    return(empty_public_reservation_table(settings_tbl))
+  }
+  
+  out <- out %>%
+    dplyr::left_join(
+      users_tbl %>% dplyr::select(user_id, full_name, user_level_label),
+      by = "user_id"
+    ) %>%
+    dplyr::mutate(
+      computer_label = purrr::map_chr(
+        computer_assigned,
+        ~ get_label_from_value(lists_tbl, "computer_assigned", .x)
+      ),
+      processing_type_label = purrr::map_chr(
+        processing_type,
+        ~ get_label_from_value(lists_tbl, "processing_type", .x)
+      ),
+      computing_demand_label = purrr::map_chr(
+        computing_demand,
+        ~ get_label_from_value(lists_tbl, "computing_demand", .x)
+      ),
+      status_label = purrr::map_chr(
+        status,
+        ~ get_label_from_value(lists_tbl, "reservation_status", .x)
+      ),
+      start_label = format_datetime_label_vector(start_dt, timezone_value),
+      end_label = format_datetime_label_vector(end_dt, timezone_value),
+      full_name = dplyr::if_else(
+        is.na(full_name) | full_name == "",
+        "Usuário não informado",
+        full_name
+      )
+    ) %>%
+    dplyr::arrange(start_dt)
+  
+  public_tbl <- tibble::tibble(
+    "Computador" = out$computer_label,
+    "Usuário" = out$full_name
+  )
+  
+  if (show_user_level) {
+    public_tbl <- public_tbl %>%
+      tibble::add_column("Categoria" = out$user_level_label, .after = "Usuário")
+  }
+  
+  public_tbl <- public_tbl %>%
+    tibble::add_column(
+      "Início" = out$start_label,
+      "Fim previsto" = out$end_label
+    )
+  
+  if (show_processing_type) {
+    public_tbl <- public_tbl %>%
+      tibble::add_column("Tipo de processamento" = out$processing_type_label)
+  }
+  
+  if (show_computing_demand) {
+    public_tbl <- public_tbl %>%
+      tibble::add_column("Demanda computacional" = out$computing_demand_label)
+  }
+  
+  public_tbl %>%
+    tibble::add_column("Status" = out$status_label)
+}
+
+public_computer_status_cards_ui <- function(
+    computers_tbl,
+    reservations_tbl,
+    users_tbl,
+    lists_tbl,
+    settings_tbl
+) {
+  timezone_value <- get_setting_value(settings_tbl, "timezone", "America/Sao_Paulo")
+  now_value <- lubridate::now(tzone = timezone_value)
+  
+  show_processing_type <- get_setting_logical(settings_tbl, "public_show_processing_type", TRUE)
+  
+  reservations_aug <- reservations_tbl %>%
+    dplyr::mutate(
+      start_dt = lubridate::ymd_hms(start_time, tz = timezone_value, quiet = TRUE),
+      end_dt = lubridate::ymd_hms(end_time, tz = timezone_value, quiet = TRUE)
+    ) %>%
+    dplyr::left_join(
+      users_tbl %>% dplyr::select(user_id, full_name),
+      by = "user_id"
+    ) %>%
+    dplyr::mutate(
+      processing_type_label = purrr::map_chr(
+        processing_type,
+        ~ get_label_from_value(lists_tbl, "processing_type", .x)
+      ),
+      full_name = dplyr::if_else(
+        is.na(full_name) | full_name == "",
+        "Usuário não informado",
+        full_name
+      )
+    )
+  
+  card_list <- purrr::pmap(
+    computers_tbl,
+    function(
+    computer_id,
+    computer_name,
+    computer_label,
+    processor,
+    cores,
+    threads,
+    ram_gb,
+    gpu,
+    gpu_memory_gb,
+    main_profile,
+    status,
+    can_be_booked,
+    public_description,
+    notes,
+    ...
+    ) {
+      current_use <- reservations_aug %>%
+        dplyr::filter(
+          computer_assigned == computer_id,
+          status %in% c("approved", "in_use"),
+          !is.na(start_dt),
+          !is.na(end_dt),
+          start_dt <= now_value,
+          end_dt >= now_value
+        ) %>%
+        dplyr::arrange(end_dt) %>%
+        dplyr::slice(1)
+      
+      next_use <- reservations_aug %>%
+        dplyr::filter(
+          computer_assigned == computer_id,
+          status %in% c("approved"),
+          !is.na(start_dt),
+          start_dt > now_value
+        ) %>%
+        dplyr::arrange(start_dt) %>%
+        dplyr::slice(1)
+      
+      if (nrow(current_use) == 1) {
+        badge_class <- "machine-badge machine-busy"
+        badge_label <- "Em uso agora"
+        
+        status_body <- tagList(
+          tags$p(
+            tags$strong("Usuário: "),
+            current_use$full_name
+          ),
+          tags$p(
+            tags$strong("Até: "),
+            format_datetime_label_vector(current_use$end_dt, timezone_value)
+          )
+        )
+        
+        if (show_processing_type) {
+          status_body <- tagList(
+            status_body,
+            tags$p(
+              tags$strong("Tipo: "),
+              current_use$processing_type_label
+            )
+          )
+        }
+      } else {
+        badge_class <- "machine-badge machine-free"
+        badge_label <- "Disponível agora"
+        
+        if (nrow(next_use) == 1) {
+          status_body <- tagList(
+            tags$p(
+              tags$strong("Próxima reserva: "),
+              next_use$full_name
+            ),
+            tags$p(
+              tags$strong("Início: "),
+              format_datetime_label_vector(next_use$start_dt, timezone_value)
+            )
+          )
+        } else {
+          status_body <- tagList(
+            tags$p("Nenhuma reserva aprovada futura para este computador.")
+          )
+        }
+      }
+      
+      tags$article(
+        class = "public-machine-card",
+        tags$div(
+          class = "public-machine-header",
+          tags$div(
+            tags$h3(computer_name),
+            tags$span(computer_label)
+          ),
+          tags$div(
+            class = badge_class,
+            badge_label
+          )
+        ),
+        tags$div(
+          class = "public-machine-body",
+          status_body
+        ),
+        tags$div(
+          class = "public-machine-specs",
+          tags$span(paste0(cores, " núcleos | ", threads, " threads")),
+          tags$span(paste0(ram_gb, " GB RAM")),
+          tags$span(paste0(gpu_memory_gb, " GB GPU"))
+        )
+      )
+    }
+  )
+  
+  tags$div(
+    class = "public-status-grid",
+    card_list
+  )
+}
+
 time_choices <- sprintf(
   "%02d:%02d",
   rep(0:23, each = 2),
@@ -893,7 +1193,7 @@ hero_ui <- function() {
         ),
         tags$div(
           tags$span("Etapa atual"),
-          tags$strong("Administração local")
+          tags$strong("Painel público local")
         )
       )
     )
@@ -1543,6 +1843,96 @@ body {
   min-height: 44px;
 }
 
+.public-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+}
+
+.public-machine-card {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large);
+  padding: 26px;
+  box-shadow: var(--shadow-soft);
+}
+
+.public-machine-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+.public-machine-header h3 {
+  margin: 0 0 5px;
+  font-size: 1.55rem;
+  font-weight: 900;
+  letter-spacing: -0.04em;
+}
+
+.public-machine-header span {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.machine-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.machine-free {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.machine-busy {
+  color: var(--orange);
+  background: var(--orange-soft);
+}
+
+.public-machine-body {
+  min-height: 96px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  background: var(--surface-soft);
+  margin-bottom: 16px;
+}
+
+.public-machine-body p {
+  margin-bottom: 8px;
+  color: #475467;
+  line-height: 1.55;
+}
+
+.public-machine-body p:last-child {
+  margin-bottom: 0;
+}
+
+.public-machine-specs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.public-machine-specs span {
+  padding: 7px 11px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
 .computer-card-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1728,7 +2118,8 @@ table.dataTable tbody td {
 
   .app-hero-grid,
   .computer-card-grid,
-  .form-layout {
+  .form-layout,
+  .public-status-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1793,7 +2184,8 @@ table.dataTable tbody td {
   .hero-summary-card,
   .section-card,
   .computer-card,
-  .app-footer {
+  .app-footer,
+  .public-machine-card {
     border-radius: 22px;
   }
 
@@ -1846,6 +2238,27 @@ ui <- bslib::page_navbar(
       uiOutput("computer_cards")
     ),
     footer_ui()
+  ),
+  
+  bslib::nav_panel(
+    title = "Painel público",
+    tags$div(
+      class = "section-card",
+      tags$h2("Status atual dos computadores"),
+      tags$p(
+        "Consulte a disponibilidade atual do Super 1 e Super 2 e acompanhe as próximas reservas aprovadas."
+      ),
+      uiOutput("public_status_cards")
+    ),
+    tags$div(
+      class = "section-card",
+      tags$h2("Próximas reservas aprovadas"),
+      tags$p(
+        "Agenda pública com as reservas aprovadas em andamento ou futuras."
+      ),
+      DT::DTOutput("public_upcoming_table")
+    ),
+    uiOutput("public_pending_block")
   ),
   
   bslib::nav_panel(
@@ -2264,6 +2677,73 @@ server <- function(input, output, session) {
   
   output$computer_cards <- renderUI({
     computer_cards_ui(computers())
+  })
+  
+  output$public_status_cards <- renderUI({
+    public_computer_status_cards_ui(
+      computers_tbl = computers(),
+      reservations_tbl = reservations(),
+      users_tbl = database()$users,
+      lists_tbl = lists(),
+      settings_tbl = settings()
+    )
+  })
+  
+  output$public_upcoming_table <- DT::renderDT({
+    DT::datatable(
+      format_public_reservations(
+        reservations_tbl = reservations(),
+        users_tbl = database()$users,
+        lists_tbl = lists(),
+        settings_tbl = settings(),
+        status_values = c("approved", "in_use"),
+        include_current = TRUE
+      ),
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        language = dt_language_pt
+      )
+    )
+  })
+  
+  output$public_pending_block <- renderUI({
+    show_pending <- get_setting_logical(settings(), "public_show_pending", TRUE)
+    
+    if (!show_pending) {
+      return(NULL)
+    }
+    
+    tags$div(
+      class = "section-card",
+      tags$h2("Reservas pendentes"),
+      tags$p(
+        "Solicitações recebidas e ainda não aprovadas pela administração."
+      ),
+      DT::DTOutput("public_pending_table")
+    )
+  })
+  
+  output$public_pending_table <- DT::renderDT({
+    DT::datatable(
+      format_public_reservations(
+        reservations_tbl = reservations(),
+        users_tbl = database()$users,
+        lists_tbl = lists(),
+        settings_tbl = settings(),
+        status_values = c("pending"),
+        include_current = TRUE
+      ),
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        language = dt_language_pt
+      )
+    )
   })
   
   booking_preview_data <- eventReactive(input$generate_booking_preview, {
