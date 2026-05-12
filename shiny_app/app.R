@@ -95,6 +95,48 @@ write_sheet_to_workbook <- function(database_file, sheet_name, data_tbl) {
   openxlsx::saveWorkbook(wb, database_file, overwrite = TRUE)
 }
 
+align_tables_as_character <- function(reference_tbl, new_tbl) {
+  reference_tbl <- reference_tbl %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::everything(),
+        ~ as.character(.x)
+      )
+    )
+  
+  new_tbl <- new_tbl %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::everything(),
+        ~ as.character(.x)
+      )
+    )
+  
+  missing_in_reference <- setdiff(names(new_tbl), names(reference_tbl))
+  
+  if (length(missing_in_reference) > 0) {
+    for (col_name in missing_in_reference) {
+      reference_tbl[[col_name]] <- NA_character_
+    }
+  }
+  
+  missing_in_new <- setdiff(names(reference_tbl), names(new_tbl))
+  
+  if (length(missing_in_new) > 0) {
+    for (col_name in missing_in_new) {
+      new_tbl[[col_name]] <- NA_character_
+    }
+  }
+  
+  new_tbl <- new_tbl %>%
+    dplyr::select(dplyr::all_of(names(reference_tbl)))
+  
+  list(
+    reference_tbl = reference_tbl,
+    new_tbl = new_tbl
+  )
+}
+
 get_active_users <- function(database) {
   database$users %>%
     dplyr::filter(status == "active") %>%
@@ -398,6 +440,52 @@ format_reservations_public <- function(reservations_tbl, users_tbl, lists_tbl) {
     )
 }
 
+format_audit_public <- function(audit_tbl, users_tbl) {
+  if (nrow(audit_tbl) == 0) {
+    return(
+      tibble::tibble(
+        "Log" = character(),
+        "Data" = character(),
+        "Evento" = character(),
+        "Reserva" = character(),
+        "Usuário" = character(),
+        "Admin" = character(),
+        "Antes" = character(),
+        "Depois" = character(),
+        "Observação" = character()
+      )
+    )
+  }
+  
+  audit_tbl %>%
+    dplyr::left_join(
+      users_tbl %>% dplyr::select(user_id, full_name),
+      by = "user_id"
+    ) %>%
+    dplyr::select(
+      log_id,
+      event_time,
+      event_type,
+      reservation_id,
+      full_name,
+      admin_user,
+      old_value,
+      new_value,
+      notes
+    ) %>%
+    dplyr::rename(
+      "Log" = log_id,
+      "Data" = event_time,
+      "Evento" = event_type,
+      "Reserva" = reservation_id,
+      "Usuário" = full_name,
+      "Admin" = admin_user,
+      "Antes" = old_value,
+      "Depois" = new_value,
+      "Observação" = notes
+    )
+}
+
 time_choices <- sprintf(
   "%02d:%02d",
   rep(0:23, each = 2),
@@ -589,6 +677,15 @@ generate_reservation_id <- function() {
   )
 }
 
+generate_log_id <- function() {
+  paste0(
+    "log_",
+    format(Sys.time(), "%Y%m%d_%H%M%S"),
+    "_",
+    sample(1000:9999, 1)
+  )
+}
+
 create_reservation_row <- function(preview, timezone_value) {
   now_value <- lubridate::now(tzone = timezone_value)
   
@@ -625,6 +722,86 @@ create_reservation_row <- function(preview, timezone_value) {
     cancelled_at = NA_character_,
     admin_notes = NA_character_,
     public_notes = preview$public_notes
+  )
+}
+
+create_audit_row <- function(
+    event_type,
+    reservation_id,
+    user_id,
+    admin_user,
+    old_value,
+    new_value,
+    notes,
+    timezone_value
+) {
+  now_value <- lubridate::now(tzone = timezone_value)
+  
+  tibble::tibble(
+    log_id = generate_log_id(),
+    event_time = format_datetime_pt(now_value, timezone_value),
+    event_type = event_type,
+    reservation_id = reservation_id,
+    user_id = user_id,
+    admin_user = admin_user,
+    old_value = old_value,
+    new_value = new_value,
+    notes = notes
+  )
+}
+
+update_reservation_status <- function(
+    reservations_tbl,
+    reservation_id_value,
+    new_status,
+    admin_user,
+    admin_notes_value,
+    timezone_value
+) {
+  now_text <- format_datetime_pt(
+    lubridate::now(tzone = timezone_value),
+    timezone_value
+  )
+  
+  reservations_tbl <- reservations_tbl %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::everything(),
+        ~ as.character(.x)
+      )
+    )
+  
+  row_id <- which(reservations_tbl$reservation_id == reservation_id_value)
+  
+  if (length(row_id) != 1) {
+    stop("Reserva não encontrada ou identificador duplicado.")
+  }
+  
+  old_status <- reservations_tbl$status[row_id]
+  
+  reservations_tbl$status[row_id] <- new_status
+  reservations_tbl$updated_at[row_id] <- now_text
+  reservations_tbl$admin_notes[row_id] <- admin_notes_value
+  
+  if (new_status == "approved") {
+    reservations_tbl$approved_by[row_id] <- admin_user
+    reservations_tbl$approved_at[row_id] <- now_text
+  }
+  
+  if (new_status == "rejected") {
+    reservations_tbl$rejected_by[row_id] <- admin_user
+    reservations_tbl$rejected_at[row_id] <- now_text
+  }
+  
+  if (new_status == "cancelled") {
+    reservations_tbl$cancelled_by[row_id] <- admin_user
+    reservations_tbl$cancelled_at[row_id] <- now_text
+  }
+  
+  list(
+    reservations_tbl = reservations_tbl,
+    old_status = old_status,
+    user_id = reservations_tbl$user_id[row_id]
   )
 }
 
@@ -716,7 +893,7 @@ hero_ui <- function() {
         ),
         tags$div(
           tags$span("Etapa atual"),
-          tags$strong("Envio local")
+          tags$strong("Administração local")
         )
       )
     )
@@ -1817,6 +1994,18 @@ ui <- bslib::page_navbar(
   ),
   
   bslib::nav_panel(
+    title = "Administração",
+    tags$div(
+      class = "section-card",
+      tags$h2("Administração"),
+      tags$p(
+        "Área para aprovar, rejeitar ou cancelar reservas. O acesso exige senha administrativa."
+      ),
+      uiOutput("admin_panel")
+    )
+  ),
+  
+  bslib::nav_panel(
     title = "Usuários",
     tags$div(
       class = "section-card",
@@ -1859,12 +2048,23 @@ ui <- bslib::page_navbar(
       tags$h2("Configurações ativas"),
       DT::DTOutput("settings_table")
     )
+  ),
+  
+  bslib::nav_panel(
+    title = "Auditoria",
+    tags$div(
+      class = "section-card",
+      tags$h2("Auditoria"),
+      tags$p("Registro local das ações administrativas gravadas na aba audit_log."),
+      DT::DTOutput("audit_table")
+    )
   )
 )
 
 server <- function(input, output, session) {
   reload_key <- reactiveVal(0)
   last_submitted_id <- reactiveVal(NULL)
+  admin_authenticated <- reactiveVal(FALSE)
   
   database <- reactive({
     reload_key()
@@ -1890,6 +2090,10 @@ server <- function(input, output, session) {
   
   reservations <- reactive({
     database()$reservations
+  })
+  
+  audit_log <- reactive({
+    database()$audit_log
   })
   
   priority_rules <- reactive({
@@ -2009,7 +2213,7 @@ server <- function(input, output, session) {
   output$system_summary <- renderUI({
     reservations_n <- nrow(reservations())
     usage_n <- nrow(database()$usage_log)
-    audit_n <- nrow(database()$audit_log)
+    audit_n <- nrow(audit_log())
     
     source_label <- ifelse(
       file.exists(database_file),
@@ -2183,44 +2387,14 @@ server <- function(input, output, session) {
     timezone_value <- get_setting_value(settings(), "timezone", "America/Sao_Paulo")
     new_reservation <- create_reservation_row(preview, timezone_value)
     
-    reservations_current <- reservations() %>%
-      dplyr::mutate(
-        dplyr::across(
-          dplyr::everything(),
-          ~ as.character(.x)
-        )
-      )
-    
-    new_reservation <- new_reservation %>%
-      dplyr::mutate(
-        dplyr::across(
-          dplyr::everything(),
-          ~ as.character(.x)
-        )
-      )
-    
-    missing_in_current <- setdiff(names(new_reservation), names(reservations_current))
-    
-    if (length(missing_in_current) > 0) {
-      for (col_name in missing_in_current) {
-        reservations_current[[col_name]] <- NA_character_
-      }
-    }
-    
-    missing_in_new <- setdiff(names(reservations_current), names(new_reservation))
-    
-    if (length(missing_in_new) > 0) {
-      for (col_name in missing_in_new) {
-        new_reservation[[col_name]] <- NA_character_
-      }
-    }
-    
-    new_reservation <- new_reservation %>%
-      dplyr::select(dplyr::all_of(names(reservations_current)))
+    aligned_reservations <- align_tables_as_character(
+      reference_tbl = reservations(),
+      new_tbl = new_reservation
+    )
     
     reservations_updated <- dplyr::bind_rows(
-      reservations_current,
-      new_reservation
+      aligned_reservations$reference_tbl,
+      aligned_reservations$new_tbl
     )
     
     tryCatch(
@@ -2258,6 +2432,304 @@ server <- function(input, output, session) {
     )
   })
   
+  output$admin_panel <- renderUI({
+    if (!admin_authenticated()) {
+      return(
+        tags$div(
+          class = "form-layout",
+          tags$div(
+            passwordInput(
+              inputId = "admin_password",
+              label = "Senha administrativa",
+              placeholder = "Digite a senha administrativa"
+            ),
+            actionButton(
+              inputId = "admin_login",
+              label = "Entrar",
+              class = "btn-primary"
+            )
+          ),
+          tags$div(
+            class = "empty-preview",
+            tags$h3("Acesso restrito"),
+            tags$p(
+              "Use esta área apenas para revisar solicitações e alterar status de reservas."
+            )
+          )
+        )
+      )
+    }
+    
+    admin_reservations <- reservations() %>%
+      dplyr::filter(status %in% c("pending", "approved", "in_use")) %>%
+      dplyr::left_join(
+        database()$users %>% dplyr::select(user_id, full_name),
+        by = "user_id"
+      ) %>%
+      dplyr::arrange(status, start_time)
+    
+    reservation_choices <- if (nrow(admin_reservations) == 0) {
+      character(0)
+    } else {
+      stats::setNames(
+        admin_reservations$reservation_id,
+        paste0(
+          admin_reservations$reservation_id,
+          " | ",
+          admin_reservations$full_name,
+          " | ",
+          admin_reservations$status
+        )
+      )
+    }
+    
+    tags$div(
+      class = "form-layout",
+      tags$div(
+        tags$h4(class = "form-section-title", "Reserva"),
+        selectInput(
+          inputId = "admin_reservation_id",
+          label = "Selecione uma reserva",
+          choices = reservation_choices
+        ),
+        textAreaInput(
+          inputId = "admin_notes",
+          label = "Observação administrativa",
+          placeholder = "Informe o motivo da decisão ou alguma orientação para o usuário.",
+          rows = 4
+        ),
+        fluidRow(
+          column(
+            width = 4,
+            actionButton(
+              inputId = "admin_approve",
+              label = "Aprovar",
+              class = "btn-success"
+            )
+          ),
+          column(
+            width = 4,
+            actionButton(
+              inputId = "admin_reject",
+              label = "Rejeitar",
+              class = "btn-warning"
+            )
+          ),
+          column(
+            width = 4,
+            actionButton(
+              inputId = "admin_cancel",
+              label = "Cancelar",
+              class = "btn-danger"
+            )
+          )
+        )
+      ),
+      tags$div(
+        uiOutput("admin_selected_reservation")
+      )
+    )
+  })
+  
+  observeEvent(input$admin_login, {
+    expected_password <- Sys.getenv("LAB_SCHEDULER_ADMIN_PASSWORD")
+    
+    if (expected_password == "") {
+      showNotification(
+        "Senha administrativa não configurada no ambiente R.",
+        type = "error",
+        duration = 8
+      )
+      return(NULL)
+    }
+    
+    if (identical(input$admin_password, expected_password)) {
+      admin_authenticated(TRUE)
+      showNotification(
+        "Acesso administrativo liberado.",
+        type = "message",
+        duration = 5
+      )
+    } else {
+      admin_authenticated(FALSE)
+      showNotification(
+        "Senha administrativa incorreta.",
+        type = "error",
+        duration = 6
+      )
+    }
+  })
+  
+  output$admin_selected_reservation <- renderUI({
+    req(admin_authenticated())
+    
+    selected_id <- input$admin_reservation_id
+    
+    if (is.null(selected_id) || selected_id == "") {
+      return(
+        tags$div(
+          class = "empty-preview",
+          tags$h3("Nenhuma reserva selecionada"),
+          tags$p("Selecione uma reserva para revisar os detalhes.")
+        )
+      )
+    }
+    
+    reservation_tbl <- reservations() %>%
+      dplyr::filter(reservation_id == selected_id) %>%
+      dplyr::left_join(
+        database()$users %>% dplyr::select(user_id, full_name, user_level_label, email),
+        by = "user_id"
+      ) %>%
+      dplyr::slice(1)
+    
+    if (nrow(reservation_tbl) == 0) {
+      return(
+        tags$div(
+          class = "empty-preview",
+          tags$h3("Reserva não encontrada"),
+          tags$p("A reserva selecionada não foi encontrada na base.")
+        )
+      )
+    }
+    
+    tags$div(
+      class = "preview-card",
+      tags$div(
+        class = "preview-header",
+        tags$div(
+          tags$span(class = "section-kicker", "Revisão administrativa"),
+          tags$h3(reservation_tbl$full_name)
+        ),
+        tags$div(
+          class = "preview-status preview-pending",
+          reservation_tbl$status
+        )
+      ),
+      tags$div(
+        class = "preview-grid",
+        tags$div(tags$span("Reserva"), tags$strong(reservation_tbl$reservation_id)),
+        tags$div(tags$span("Categoria"), tags$strong(reservation_tbl$user_level_label)),
+        tags$div(tags$span("Computador solicitado"), tags$strong(reservation_tbl$computer_requested)),
+        tags$div(tags$span("Computador atribuído"), tags$strong(reservation_tbl$computer_assigned)),
+        tags$div(tags$span("Início"), tags$strong(reservation_tbl$start_time)),
+        tags$div(tags$span("Fim previsto"), tags$strong(reservation_tbl$end_time)),
+        tags$div(tags$span("Duração h"), tags$strong(reservation_tbl$estimated_hours)),
+        tags$div(tags$span("Prioridade"), tags$strong(reservation_tbl$priority_score)),
+        tags$div(tags$span("Tipo"), tags$strong(reservation_tbl$processing_type)),
+        tags$div(tags$span("Demanda"), tags$strong(reservation_tbl$computing_demand)),
+        tags$div(tags$span("Usa GPU"), tags$strong(reservation_tbl$uses_gpu)),
+        tags$div(tags$span("Exige Super 2"), tags$strong(reservation_tbl$requires_super_2))
+      ),
+      tags$div(
+        class = "preview-reasons",
+        tags$span("Justificativa"),
+        tags$p(reservation_tbl$justification)
+      )
+    )
+  })
+  
+  process_admin_action <- function(new_status, event_type) {
+    req(admin_authenticated())
+    req(input$admin_reservation_id)
+    
+    selected_id <- input$admin_reservation_id
+    timezone_value <- get_setting_value(settings(), "timezone", "America/Sao_Paulo")
+    admin_user <- "admin"
+    admin_notes_value <- ifelse(
+      is.null(input$admin_notes) || input$admin_notes == "",
+      NA_character_,
+      input$admin_notes
+    )
+    
+    tryCatch(
+      {
+        updated_result <- update_reservation_status(
+          reservations_tbl = reservations(),
+          reservation_id_value = selected_id,
+          new_status = new_status,
+          admin_user = admin_user,
+          admin_notes_value = admin_notes_value,
+          timezone_value = timezone_value
+        )
+        
+        audit_row <- create_audit_row(
+          event_type = event_type,
+          reservation_id = selected_id,
+          user_id = updated_result$user_id,
+          admin_user = admin_user,
+          old_value = updated_result$old_status,
+          new_value = new_status,
+          notes = admin_notes_value,
+          timezone_value = timezone_value
+        )
+        
+        aligned_audit <- align_tables_as_character(
+          reference_tbl = audit_log(),
+          new_tbl = audit_row
+        )
+        
+        audit_updated <- dplyr::bind_rows(
+          aligned_audit$reference_tbl,
+          aligned_audit$new_tbl
+        )
+        
+        write_sheet_to_workbook(
+          database_file = database_file,
+          sheet_name = "reservations",
+          data_tbl = updated_result$reservations_tbl
+        )
+        
+        write_sheet_to_workbook(
+          database_file = database_file,
+          sheet_name = "audit_log",
+          data_tbl = audit_updated
+        )
+        
+        reload_key(reload_key() + 1)
+        
+        showNotification(
+          paste0("Reserva atualizada para: ", new_status),
+          type = "message",
+          duration = 6
+        )
+        
+        updateTabsetPanel(session, "main_nav", selected = "Reservas")
+      },
+      error = function(e) {
+        showNotification(
+          paste(
+            "Não foi possível atualizar a reserva. Verifique se o Excel está fechado.",
+            e$message
+          ),
+          type = "error",
+          duration = 10
+        )
+      }
+    )
+  }
+  
+  observeEvent(input$admin_approve, {
+    process_admin_action(
+      new_status = "approved",
+      event_type = "reservation_approved"
+    )
+  })
+  
+  observeEvent(input$admin_reject, {
+    process_admin_action(
+      new_status = "rejected",
+      event_type = "reservation_rejected"
+    )
+  })
+  
+  observeEvent(input$admin_cancel, {
+    process_admin_action(
+      new_status = "cancelled",
+      event_type = "reservation_cancelled"
+    )
+  })
+  
   output$reservations_table <- DT::renderDT({
     DT::datatable(
       format_reservations_public(reservations(), database()$users, lists()),
@@ -2267,6 +2739,20 @@ server <- function(input, output, session) {
         pageLength = 10,
         scrollX = TRUE,
         order = list(list(4, "desc")),
+        language = dt_language_pt
+      )
+    )
+  })
+  
+  output$audit_table <- DT::renderDT({
+    DT::datatable(
+      format_audit_public(audit_log(), database()$users),
+      rownames = FALSE,
+      filter = "top",
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        order = list(list(1, "desc")),
         language = dt_language_pt
       )
     )
