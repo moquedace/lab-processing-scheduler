@@ -36,18 +36,52 @@ if (sheet_url == "") {
   stop("Set LAB_SCHEDULER_SHEET_URL before running the app.")
 }
 
-googlesheets4::gs4_auth(email = TRUE)
+service_account_json <- Sys.getenv("LAB_SCHEDULER_SERVICE_ACCOUNT_JSON")
+
+service_account_candidates <- c(
+  service_account_json,
+  file.path(app_dir, "secrets", "google_service_account.json"),
+  file.path(project_root, "shiny_app", "secrets", "google_service_account.json"),
+  file.path(project_root, "secrets", "google_service_account.json")
+)
+
+service_account_candidates <- service_account_candidates[
+  !is.na(service_account_candidates) &
+    service_account_candidates != ""
+]
+
+service_account_candidates <- normalizePath(
+  service_account_candidates,
+  winslash = "/",
+  mustWork = FALSE
+)
+
+service_account_json <- service_account_candidates[
+  file.exists(service_account_candidates)
+][1]
+
+if (!is.na(service_account_json) && file.exists(service_account_json)) {
+  googlesheets4::gs4_auth(
+    path = service_account_json,
+    scopes = "https://www.googleapis.com/auth/spreadsheets"
+  )
+} else {
+  googlesheets4::gs4_auth(email = TRUE)
+}
 
 database_file <- sheet_url
 
-logo_dir <- file.path(
-  project_root,
-  "docs",
-  "assets",
-  "img"
+logo_dir_candidates <- c(
+  file.path(app_dir, "www", "img"),
+  file.path(project_root, "shiny_app", "www", "img"),
+  file.path(project_root, "docs", "assets", "img")
 )
 
-if (dir.exists(logo_dir)) {
+logo_dir <- logo_dir_candidates[
+  dir.exists(logo_dir_candidates)
+][1]
+
+if (!is.na(logo_dir) && dir.exists(logo_dir)) {
   shiny::addResourcePath("site-assets", logo_dir)
 }
 
@@ -263,13 +297,25 @@ get_rule_points <- function(priority_rules_tbl, rule_group_value, condition_valu
 }
 
 get_deadline_points <- function(priority_rules_tbl, deadline_date) {
-  if (is.null(deadline_date) || is.na(deadline_date)) {
+  if (is.null(deadline_date) || length(deadline_date) == 0) {
     return(0)
   }
   
-  days_to_deadline <- as.numeric(as.Date(deadline_date) - Sys.Date())
+  deadline_date <- deadline_date[1]
   
-  if (is.na(days_to_deadline) || days_to_deadline < 0) {
+  if (is.na(deadline_date) || identical(deadline_date, "") || identical(deadline_date, "NA")) {
+    return(0)
+  }
+  
+  deadline_date <- suppressWarnings(as.Date(deadline_date))
+  
+  if (is.na(deadline_date)) {
+    return(0)
+  }
+  
+  days_to_deadline <- as.numeric(deadline_date - Sys.Date())
+  
+  if (is.na(days_to_deadline) || !is.finite(days_to_deadline) || days_to_deadline < 0) {
     return(0)
   }
   
@@ -2391,7 +2437,7 @@ ui <- bslib::page_navbar(
           dateInput(
             inputId = "booking_deadline",
             label = "Data limite do processamento, se houver",
-            value = NA,
+            value = NULL,
             language = "pt-BR",
             weekstart = 0
           ),
@@ -2776,6 +2822,16 @@ server <- function(input, output, session) {
   booking_preview_data <- eventReactive(input$generate_booking_preview, {
     user_tbl <- selected_user()
     
+    estimated_hours_value <- suppressWarnings(
+      as.numeric(input$booking_estimated_hours)
+    )
+    
+    deadline_value <- input$booking_deadline
+    
+    if (is.null(deadline_value) || length(deadline_value) == 0 || is.na(deadline_value)) {
+      deadline_value <- NA
+    }
+    
     validate(
       need(nrow(user_tbl) == 1, "Selecione um usuário válido."),
       need(input$booking_email != "", "Confirme o e-mail cadastrado."),
@@ -2783,10 +2839,19 @@ server <- function(input, output, session) {
         stringr::str_to_lower(input$booking_email) == stringr::str_to_lower(user_tbl$email),
         "O e-mail informado não confere com o e-mail cadastrado."
       ),
-      need(input$booking_estimated_hours > 0, "Informe uma duração válida.")
+      need(
+        !is.na(estimated_hours_value) &&
+          is.finite(estimated_hours_value) &&
+          estimated_hours_value > 0,
+        "Informe uma duração válida."
+      )
     )
     
-    timezone_value <- get_setting_value(settings(), "timezone", "America/Sao_Paulo")
+    timezone_value <- get_setting_value(
+      settings(),
+      "timezone",
+      "America/Sao_Paulo"
+    )
     
     start_time_value <- parse_datetime(
       input$booking_start_date,
@@ -2794,7 +2859,7 @@ server <- function(input, output, session) {
       timezone_value
     )
     
-    end_time_value <- start_time_value + lubridate::hours(input$booking_estimated_hours)
+    end_time_value <- start_time_value + lubridate::dhours(estimated_hours_value)
     
     assigned_computer <- suggest_computer_assignment(
       computer_requested = input$booking_computer_requested,
@@ -2815,11 +2880,11 @@ server <- function(input, output, session) {
     
     priority_score <- calculate_priority_score(
       user_level = user_tbl$user_level,
-      deadline_date = input$booking_deadline,
+      deadline_date = deadline_value,
       computing_demand = input$booking_computing_demand,
       requires_super_2 = input$booking_requires_super_2,
       uses_gpu = input$booking_uses_gpu,
-      estimated_hours = input$booking_estimated_hours,
+      estimated_hours = estimated_hours_value,
       can_be_reallocated = input$booking_can_be_reallocated,
       main_environment = input$booking_main_environment,
       priority_rules_tbl = priority_rules()
@@ -2827,7 +2892,7 @@ server <- function(input, output, session) {
     
     approval_decision <- decide_approval_mode(
       user_level = user_tbl$user_level,
-      estimated_hours = input$booking_estimated_hours,
+      estimated_hours = estimated_hours_value,
       requires_super_2 = input$booking_requires_super_2,
       computing_demand = input$booking_computing_demand,
       has_conflict = has_conflict,
@@ -2852,27 +2917,49 @@ server <- function(input, output, session) {
       user_level = user_tbl$user_level,
       user_level_label = user_tbl$user_level_label,
       computer_requested = input$booking_computer_requested,
-      computer_requested_label = names(choices_computer_requested)[match(input$booking_computer_requested, choices_computer_requested)],
+      computer_requested_label = names(choices_computer_requested)[
+        match(input$booking_computer_requested, choices_computer_requested)
+      ],
       computer_assigned = assigned_computer,
-      computer_assigned_label = names(choices_computer_assigned)[match(assigned_computer, choices_computer_assigned)],
+      computer_assigned_label = names(choices_computer_assigned)[
+        match(assigned_computer, choices_computer_assigned)
+      ],
       start_time = start_time_value,
-      start_time_label = format_datetime_label_pt(start_time_value, timezone_value),
+      start_time_label = format_datetime_label_pt(
+        start_time_value,
+        timezone_value
+      ),
       end_time = end_time_value,
-      end_time_label = format_datetime_label_pt(end_time_value, timezone_value),
-      estimated_hours = input$booking_estimated_hours,
+      end_time_label = format_datetime_label_pt(
+        end_time_value,
+        timezone_value
+      ),
+      estimated_hours = estimated_hours_value,
       main_environment = input$booking_main_environment,
-      main_environment_label = names(choices_environment)[match(input$booking_main_environment, choices_environment)],
+      main_environment_label = names(choices_environment)[
+        match(input$booking_main_environment, choices_environment)
+      ],
       processing_type = input$booking_processing_type,
-      processing_type_label = names(choices_processing)[match(input$booking_processing_type, choices_processing)],
+      processing_type_label = names(choices_processing)[
+        match(input$booking_processing_type, choices_processing)
+      ],
       computing_demand = input$booking_computing_demand,
-      computing_demand_label = names(choices_demand)[match(input$booking_computing_demand, choices_demand)],
+      computing_demand_label = names(choices_demand)[
+        match(input$booking_computing_demand, choices_demand)
+      ],
       uses_gpu = input$booking_uses_gpu,
-      uses_gpu_label = names(choices_yes_no)[match(input$booking_uses_gpu, choices_yes_no)],
+      uses_gpu_label = names(choices_yes_no)[
+        match(input$booking_uses_gpu, choices_yes_no)
+      ],
       requires_super_2 = input$booking_requires_super_2,
-      requires_super_2_label = names(choices_yes_no)[match(input$booking_requires_super_2, choices_yes_no)],
+      requires_super_2_label = names(choices_yes_no)[
+        match(input$booking_requires_super_2, choices_yes_no)
+      ],
       can_be_reallocated = input$booking_can_be_reallocated,
-      can_be_reallocated_label = names(choices_yes_no)[match(input$booking_can_be_reallocated, choices_yes_no)],
-      deadline = input$booking_deadline,
+      can_be_reallocated_label = names(choices_yes_no)[
+        match(input$booking_can_be_reallocated, choices_yes_no)
+      ],
+      deadline = deadline_value,
       justification = input$booking_justification,
       public_notes = input$booking_public_notes,
       priority_score = priority_score,
