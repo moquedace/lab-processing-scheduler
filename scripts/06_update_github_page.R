@@ -1,4 +1,76 @@
-<!DOCTYPE html>
+pkg <- c(
+  "fs"
+)
+
+missing_pkg <- pkg[!vapply(pkg, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_pkg) > 0) {
+  install.packages(missing_pkg)
+}
+
+invisible(lapply(pkg, library, character.only = TRUE))
+
+rm(list = ls())
+gc()
+
+project_root <- if (basename(getwd()) == "scripts") {
+  normalizePath(file.path(getwd(), ".."), winslash = "/", mustWork = TRUE)
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+docs_dir <- file.path(project_root, "docs")
+assets_dir <- file.path(docs_dir, "assets")
+img_dir <- file.path(assets_dir, "img")
+index_file <- file.path(docs_dir, "index.html")
+
+shiny_app_url <- "https://moquedace.shinyapps.io/lab-processing-scheduler/"
+
+required_logos <- c(
+  "logo_geocis.png",
+  "logo_solos.png",
+  "logo_esalq.png",
+  "logo_usp.png",
+  "logo_fapesp.png"
+)
+
+fs::dir_create(docs_dir)
+fs::dir_create(img_dir)
+
+missing_logos <- required_logos[
+  !file.exists(file.path(img_dir, required_logos))
+]
+
+if (length(missing_logos) > 0) {
+  stop(
+    paste(
+      "Missing logo files in docs/assets/img:",
+      paste(missing_logos, collapse = ", ")
+    )
+  )
+}
+
+if (file.exists(index_file)) {
+  backup_file <- file.path(
+    docs_dir,
+    paste0(
+      "index_backup_",
+      format(Sys.time(), "%Y%m%d_%H%M%S"),
+      ".html"
+    )
+  )
+  
+  fs::file_copy(
+    path = index_file,
+    new_path = backup_file,
+    overwrite = TRUE
+  )
+  
+  message("Backup created: ", backup_file)
+}
+
+html_content <- paste0(
+  '<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
@@ -622,10 +694,10 @@
           sensoriamento remoto, grandes mosaicos raster e análises com alta demanda computacional.
         </p>
         <div class="hero-actions">
-          <a class="button-primary" href="https://moquedace.shinyapps.io/lab-processing-scheduler/" target="_blank" rel="noopener noreferrer">
+          <a class="button-primary" href="', shiny_app_url, '" target="_blank" rel="noopener noreferrer">
             Acessar sistema de reservas
           </a>
-          <a class="button-secondary" href="https://moquedace.shinyapps.io/lab-processing-scheduler/" target="_blank" rel="noopener noreferrer">
+          <a class="button-secondary" href="', shiny_app_url, '" target="_blank" rel="noopener noreferrer">
             Abrir painel público
           </a>
         </div>
@@ -770,4 +842,26 @@
     </footer>
   </main>
 </body>
-</html>
+</html>'
+)
+
+writeLines(
+  text = html_content,
+  con = index_file,
+  useBytes = TRUE
+)
+
+message("GitHub Pages index updated:")
+message(index_file)
+message("Open this file locally or push to GitHub Pages.")
+
+
+writeLines(
+  text = html_content,
+  con = index_file,
+  useBytes = TRUE
+)
+
+message("GitHub Pages index updated:")
+message(index_file)
+message("Open this file locally or push to GitHub Pages.")
